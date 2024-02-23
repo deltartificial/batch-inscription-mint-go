@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,14 +19,45 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var rpcURLs = []string{
+	"https://ava-mainnet.public.blastapi.io/ext/bc/C/rpc",
+	"https://avalanche.blockpi.network/v1/rpc/public",
+	"https://avax.meowrpc.com",
+	"https://rpc.ankr.com/avalanche",
+	"https://avalanche.public-rpc.com",
+	"https://avalanche.drpc.org",
+	"https://rpc.tornadoeth.cash/avax",
+	"https://api.zan.top/node/v1/avax/mainnet/public/ext/bc/C/rpc",
+	"https://1rpc.io/avax/c",
+	"https://endpoints.omniatech.io/v1/avax/mainnet/public",
+	"https://blastapi.io/public-api/avalanche",
+	"https://avalancheapi.terminet.io/ext/bc/C/rpc",
+	"https://avax-pokt.nodies.app/ext/bc/C/rpc",
+	"https://avalanche.api.onfinality.io/public/ext/bc/C/rpc",
+	"https://avalanche-c-chain-rpc.publicnode.com",
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 
-	httpRPC, privateKeyHex, numWorkersStr, transactionsNumberStr, jsonData := getConfig()
+	privateKeyHex, numWorkersStr, transactionsNumberStr, jsonData := getConfig()
 
-	client, privateKey, fromAddress := ethereumSetup(httpRPC, privateKeyHex)
+	var rpcIndex int
+	var client *ethclient.Client
+	var err error
+	for {
+		client, err = ethclient.Dial(rpcURLs[rpcIndex])
+		if err != nil {
+			log.Printf("Error connecting to eth client at %s: %v", rpcURLs[rpcIndex], err)
+			rpcIndex = (rpcIndex + 1) % len(rpcURLs)
+			continue
+		}
+		break
+	}
+
+	privateKey, fromAddress := ethereumSetup(privateKeyHex, client)
 
 	nonce := getInitialNonce(client, fromAddress)
 
@@ -37,21 +69,20 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkersStr; i++ {
 		wg.Add(1)
-		go worker(client, privateKey, fromAddress, &wg, txnsChan, jsonData, nonce, gasPrice)
+		go worker(&wg, txnsChan, jsonData, nonce, gasPrice, privateKey, fromAddress, &rpcIndex)
 		nonce += uint64(transactionsNumberStr) / uint64(numWorkersStr)
 	}
 
 	for i := 0; i < transactionsNumberStr; i++ {
 		txnsChan <- i
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond) 
 	}
 
 	wg.Wait()
 	fmt.Println("✨ All transactions sent.")
 }
 
-func getConfig() (httpRPC, privateKeyHex string, numWorkersStr, transactionsNumberStr int, jsonData string) {
-	httpRPC = os.Getenv("HTTP_RPC_URL")
+func getConfig() (privateKeyHex string, numWorkersStr, transactionsNumberStr int, jsonData string) {
 	privateKeyHex = os.Getenv("PRIVATE_KEY_HEX")
 	numWorkersStr, _ = strconv.Atoi(os.Getenv("NUM_WORKERS"))
 	transactionsNumberStr, _ = strconv.Atoi(os.Getenv("TRANSACTIONS_NUMBER"))
@@ -59,12 +90,7 @@ func getConfig() (httpRPC, privateKeyHex string, numWorkersStr, transactionsNumb
 	return
 }
 
-func ethereumSetup(httpRPC, privateKeyHex string) (*ethclient.Client, *ecdsa.PrivateKey, common.Address) {
-	client, err := ethclient.Dial(httpRPC)
-	if err != nil {
-		log.Fatal("error connecting to eth client:", err)
-	}
-
+func ethereumSetup(privateKeyHex string, client *ethclient.Client) (*ecdsa.PrivateKey, common.Address) {
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
 		log.Fatal("error reading private key:", err)
@@ -76,7 +102,7 @@ func ethereumSetup(httpRPC, privateKeyHex string) (*ethclient.Client, *ecdsa.Pri
 	}
 
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	return client, privateKey, fromAddress
+	return privateKey, fromAddress
 }
 
 func getInitialNonce(client *ethclient.Client, fromAddress common.Address) uint64 {
@@ -95,17 +121,32 @@ func getGasPrice(client *ethclient.Client) *big.Int {
 	return gasPrice
 }
 
-func worker(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, wg *sync.WaitGroup, txnsChan <-chan int, jsonData string, startNonce uint64, gasPrice *big.Int) {
+func worker(wg *sync.WaitGroup, txnsChan <-chan int, jsonData string, startNonce uint64, gasPrice *big.Int, privateKey *ecdsa.PrivateKey, fromAddress common.Address, rpcIndex *int) {
 	defer wg.Done()
 
 	nonce := startNonce
+	txCount := 0
 	for range txnsChan {
-		sendTransaction(client, privateKey, fromAddress, jsonData, nonce, gasPrice)
-		nonce++ 
+		client, err := ethclient.Dial(rpcURLs[*rpcIndex])
+		if err != nil {
+			log.Printf("Error connecting to eth client at %s: %v", rpcURLs[*rpcIndex], err)
+			*rpcIndex = (*rpcIndex + 1) % len(rpcURLs)
+			fmt.Println("Changing rpc...")
+			continue
+		}
+
+		if err := sendTransaction(client, privateKey, fromAddress, jsonData, nonce, gasPrice, rpcIndex); err != nil {
+			fmt.Println("Changing rpc...")
+			*rpcIndex = (*rpcIndex + 1) % len(rpcURLs)
+			client, _ = ethclient.Dial(rpcURLs[*rpcIndex]) 
+			sendTransaction(client, privateKey, fromAddress, jsonData, nonce, gasPrice, rpcIndex)
+		}
+		nonce++
+		txCount++
 	}
 }
 
-func sendTransaction(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, jsonData string, nonce uint64, gasPrice *big.Int) {
+func sendTransaction(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, jsonData string, nonce uint64, gasPrice *big.Int, rpcIndex *int) error {
 	value := big.NewInt(0)
 	gasLimit := uint64(22000)
 	data := []byte(jsonData)
@@ -115,19 +156,23 @@ func sendTransaction(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fro
 	chainID, err := client.NetworkID(context.Background())
 	if err != nil {
 		log.Printf("error getting network ID: %v", err)
-		return
+		return err
 	}
 
 	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
 	if err != nil {
 		log.Printf("error signing transaction: %v", err)
-		return
+		return err
 	}
 
 	if err := client.SendTransaction(context.Background(), signedTx); err != nil {
 		log.Printf("error sending transaction: %v", err)
-		return
+		if strings.Contains(err.Error(), "429") {
+			return err
+		}
+		return err
 	}
 
 	fmt.Printf("📜 Transaction sent: %s\n", signedTx.Hash().Hex())
+	return nil
 }
