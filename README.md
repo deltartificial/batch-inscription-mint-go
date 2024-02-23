@@ -32,6 +32,8 @@ go get .
 
 Create a `.env` file in the root of the project directory with the following variables:
 
+or, `export HTTP_RPC_URL=http://localhost:8545`, same for each one.
+
 ```plaintext
 HTTP_RPC_URL=http://localhost:8545
 PRIVATE_KEY_HEX=your_private_key_hex_here
