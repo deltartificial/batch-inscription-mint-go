@@ -11,46 +11,55 @@ import (
 	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/joho/godotenv"
 )
 
-/// @title 📜 Batch Inscription Mint in Golang
-/// @dev Send multiple & automatized mint transactions in Go, for all EVM networks.
-/// @author deltartificial
-
 func main() {
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 
-	httpRPC := os.Getenv("HTTP_RPC_URL")
-	privateKeyHex := os.Getenv("PRIVATE_KEY_HEX")
-	numWorkersStr := os.Getenv("NUM_WORKERS")
-	transactionsNumberStr := os.Getenv("TRANSACTIONS_NUMBER")
-	jsonData := os.Getenv("JSON_DATA")
+	httpRPC, privateKeyHex, numWorkersStr, transactionsNumberStr, jsonData := getConfig()
 
-	fmt.Println("--------------------------------")
-	fmt.Println("@author : deltartificial")
-	fmt.Println("Data to send :", jsonData)
-	fmt.Println("Number of transactions to send :", transactionsNumberStr)
-	fmt.Println("--------------------------------")
+	client, privateKey, fromAddress := ethereumSetup(httpRPC, privateKeyHex)
 
-	numWorkers, err := strconv.Atoi(numWorkersStr)
-	if err != nil {
-		log.Fatal("error converting NUM_WORKERS to int:", err)
+	nonce := getInitialNonce(client, fromAddress)
+
+	txnsChan := make(chan int, transactionsNumberStr)
+	defer close(txnsChan)
+
+	gasPrice := getGasPrice(client)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkersStr; i++ {
+		wg.Add(1)
+		go worker(client, privateKey, fromAddress, &wg, txnsChan, jsonData, nonce, gasPrice)
+		nonce += uint64(transactionsNumberStr) / uint64(numWorkersStr)
 	}
 
-	transactionsNumber, err := strconv.Atoi(transactionsNumberStr)
-	if err != nil {
-		log.Fatal("error converting TRANSACTIONS_NUMBER to int:", err)
+	for i := 0; i < transactionsNumberStr; i++ {
+		txnsChan <- i
+		time.Sleep(1 * time.Second)
 	}
 
+	wg.Wait()
+	fmt.Println("✨ All transactions sent.")
+}
+
+func getConfig() (httpRPC, privateKeyHex string, numWorkersStr, transactionsNumberStr int, jsonData string) {
+	httpRPC = os.Getenv("HTTP_RPC_URL")
+	privateKeyHex = os.Getenv("PRIVATE_KEY_HEX")
+	numWorkersStr, _ = strconv.Atoi(os.Getenv("NUM_WORKERS"))
+	transactionsNumberStr, _ = strconv.Atoi(os.Getenv("TRANSACTIONS_NUMBER"))
+	jsonData = os.Getenv("JSON_DATA")
+	return
+}
+
+func ethereumSetup(httpRPC, privateKeyHex string) (*ethclient.Client, *ecdsa.PrivateKey, common.Address) {
 	client, err := ethclient.Dial(httpRPC)
 	if err != nil {
 		log.Fatal("error connecting to eth client:", err)
@@ -61,81 +70,62 @@ func main() {
 		log.Fatal("error reading private key:", err)
 	}
 
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	publicKeyECDSA, ok := privateKey.Public().(*ecdsa.PublicKey)
 	if !ok {
 		log.Fatal("error casting public key to ECDSA")
 	}
 
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+	return client, privateKey, fromAddress
+}
+
+func getInitialNonce(client *ethclient.Client, fromAddress common.Address) uint64 {
 	nonce, err := client.PendingNonceAt(context.Background(), fromAddress)
 	if err != nil {
 		log.Fatal("error getting nonce:", err)
 	}
-
-	txnsChan := make(chan int, transactionsNumber)
-	nonceChan := make(chan uint64, transactionsNumber)
-	for i := nonce; i < nonce+uint64(transactionsNumber); i++ {
-		nonceChan <- i
-	}
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go worker(client, privateKey, fromAddress, &wg, txnsChan, nonceChan, jsonData)
-	}
-
-	for i := 0; i < transactionsNumber; i++ {
-		txnsChan <- i
-		time.Sleep(1 * time.Second)
-	}
-	close(txnsChan)
-	close(nonceChan)
-
-	wg.Wait()
-	fmt.Println("✨ All transactions sent.")
+	return nonce
 }
 
-func worker(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, wg *sync.WaitGroup, txnsChan <-chan int, nonceChan <-chan uint64, jsonData string) {
-	defer wg.Done()
-
-	for _ = range txnsChan {
-		nonce := <-nonceChan
-		sendTransaction(client, privateKey, fromAddress, jsonData, nonce)
-	}
-}
-
-func sendTransaction(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, jsonData string, nonce uint64) {
+func getGasPrice(client *ethclient.Client) *big.Int {
 	gasPrice, err := client.SuggestGasPrice(context.Background())
 	if err != nil {
 		log.Fatal("error getting gas price:", err)
-		return
 	}
+	return gasPrice
+}
 
-	value := big.NewInt(0) 
+func worker(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, wg *sync.WaitGroup, txnsChan <-chan int, jsonData string, startNonce uint64, gasPrice *big.Int) {
+	defer wg.Done()
+
+	nonce := startNonce
+	for range txnsChan {
+		sendTransaction(client, privateKey, fromAddress, jsonData, nonce, gasPrice)
+		nonce++ 
+	}
+}
+
+func sendTransaction(client *ethclient.Client, privateKey *ecdsa.PrivateKey, fromAddress common.Address, jsonData string, nonce uint64, gasPrice *big.Int) {
+	value := big.NewInt(0)
 	gasLimit := uint64(22000)
 	data := []byte(jsonData)
 
 	tx := types.NewTransaction(nonce, fromAddress, value, gasLimit, gasPrice, data)
 
-	
-
 	chainID, err := client.NetworkID(context.Background())
 	if err != nil {
-		log.Fatal("error getting network ID:", err)
+		log.Printf("error getting network ID: %v", err)
 		return
 	}
 
 	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(chainID), privateKey)
 	if err != nil {
-		log.Fatal("error signing transaction:", err)
+		log.Printf("error signing transaction: %v", err)
 		return
 	}
 
-	err = client.SendTransaction(context.Background(), signedTx)
-	if err != nil {
-		log.Fatal("error sending transaction:", err)
+	if err := client.SendTransaction(context.Background(), signedTx); err != nil {
+		log.Printf("error sending transaction: %v", err)
 		return
 	}
 
